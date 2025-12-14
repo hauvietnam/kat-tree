@@ -68,6 +68,170 @@ except ImportError as e:
     has_functorch = False
     
 import katransformer
+#Add focal loss 
+import torch.nn.functional as F
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss như được mô tả trong paper "Focal Loss for Dense Object Detection".
+    Tập trung vào các mẫu khó phân loại và có thể kết hợp với class weights.
+    
+    Args:
+        alpha: Trọng số lớp, có thể là tensor hoặc float.
+        gamma: Tham số focusing (default: 2.0)
+        reduction: 'none' | 'mean' | 'sum'
+    """
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: [B, C] tensor với logits (đầu ra mô hình)
+            targets: [B] tensor với nhãn đích (target class)
+        """
+        # Tính log softmax
+        log_softmax = F.log_softmax(inputs, dim=1)
+        
+        # Lấy log-probability cho lớp đúng
+        logpt = log_softmax.gather(1, targets.unsqueeze(1))
+        logpt = logpt.squeeze(1)
+        
+        # Chuyển về probability
+        pt = torch.exp(logpt)
+        
+        # Tính focal weight
+        focal_weight = (1 - pt) ** self.gamma
+        
+        # Áp dụng alpha weight nếu có
+        if self.alpha is not None:
+            if isinstance(self.alpha, torch.Tensor):
+                alpha_t = self.alpha.gather(0, targets)
+            else:
+                alpha_t = self.alpha
+            focal_weight = alpha_t * focal_weight
+        
+        # Tính loss
+        loss = -focal_weight * logpt
+        
+        # Áp dụng reduction
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+# 3. Thêm hàm tính trọng số tự động
+def compute_auto_weights(dataset, num_classes, method='smooth_power', beta=0.9999, power=0.3):
+    """
+    Tính trọng số tự động dựa trên phân bố của các lớp
+    """
+    import math
+    import os
+    
+    # Đếm số lượng mẫu mỗi lớp
+    class_counts = [0] * num_classes
+    
+    # Phương pháp 1: Sử dụng thuộc tính của dataset nếu có
+    found_class_counts = False
+    
+    if hasattr(dataset, 'targets') and isinstance(dataset.targets, (list, torch.Tensor)):
+        # Trường hợp dataset.targets là list hoặc tensor
+        for target in dataset.targets:
+            if isinstance(target, torch.Tensor):
+                target = target.item()
+            if 0 <= target < num_classes:
+                class_counts[target] += 1
+        found_class_counts = True
+    elif hasattr(dataset, 'samples') and isinstance(dataset.samples, list):
+        # Trường hợp ImageFolder
+        for _, target in dataset.samples:
+            if 0 <= target < num_classes:
+                class_counts[target] += 1
+        found_class_counts = True
+    elif hasattr(dataset, 'imgs') and isinstance(dataset.imgs, list):
+        # Trường hợp datasets.ImageFolder cũ
+        for _, target in dataset.imgs:
+            if 0 <= target < num_classes:
+                class_counts[target] += 1
+        found_class_counts = True
+    
+    # Phương pháp 2: Nếu không tìm được thuộc tính, duyệt qua dataset
+    if not found_class_counts or sum(class_counts) == 0:
+        if hasattr(dataset, 'data_dir') and os.path.exists(dataset.data_dir):
+            # Đếm số lượng file trong thư mục train/class
+            train_dir = os.path.join(dataset.data_dir, 'train')
+            if os.path.exists(train_dir) and os.path.isdir(train_dir):
+                class_folders = sorted([d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))])
+                
+                for i, class_folder in enumerate(class_folders):
+                    if i < num_classes:
+                        class_path = os.path.join(train_dir, class_folder)
+                        # Đếm số file trong thư mục class
+                        class_counts[i] = len([f for f in os.listdir(class_path) if os.path.isfile(os.path.join(class_path, f))])
+                
+                found_class_counts = True
+        
+        # Nếu vẫn không tìm thấy, sử dụng duyệt qua dataset
+        if not found_class_counts or sum(class_counts) == 0:
+            _logger.warning("Dataset structure not recognized. Counting classes by iterating through dataset.")
+            
+            # Phương pháp này có thể chậm với dataset lớn
+            # Giới hạn số lượng mẫu kiểm tra để tránh chạy quá lâu
+            # max_samples = min(10000, len(dataset))
+            max_samples = len(dataset)
+            
+            for i in range(max_samples):
+                try:
+                    _, target = dataset[i]
+                    if isinstance(target, torch.Tensor):
+                        target = target.item()
+                    if 0 <= target < num_classes:
+                        class_counts[target] += 1
+                except Exception as e:
+                    _logger.warning(f"Error processing sample {i}: {e}")
+                    continue
+    
+    # Tính trọng số theo phương pháp chỉ định
+    weights = []
+    for count in class_counts:
+        if count <= 0:
+            weights.append(1.0)  # Giá trị mặc định cho lớp không có mẫu
+        else:
+            if method == 'inverse':
+                weights.append(1.0 / count)
+            elif method == 'effective':
+                effective_num = 1.0 - beta ** count
+                weights.append((1.0 - beta) / effective_num)
+            elif method == 'sqrt':
+                weights.append(1.0 / math.sqrt(count))
+            elif method == 'log':
+                weights.append(1.0 / math.log(1.1 + count))
+            elif method == 'smooth_power':
+                weights.append(1.0 / (count ** power))
+    
+    # Hiển thị class counts
+    _logger.info(f"Class counts: {class_counts}")
+    
+    # Kiểm tra nếu không tìm thấy mẫu nào
+    if sum(class_counts) == 0:
+        _logger.warning("Failed to count class distributions. Using uniform weights.")
+        return torch.ones(num_classes), [0] * num_classes
+    
+    # Chuẩn hóa trọng số
+    weights = torch.FloatTensor(weights)
+    weights = weights * (num_classes / weights.sum())
+    
+    return weights, class_counts
+
+
+
+
 
 has_compile = hasattr(torch, 'compile')
 
@@ -257,7 +421,7 @@ group.add_argument('--warmup-prefix', action='store_true', default=False,
                    help='Exclude warmup period from decay schedule.'),
 group.add_argument('--cooldown-epochs', type=int, default=0, metavar='N',
                    help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
-group.add_argument('--patience-epochs', type=int, default=10, metavar='N',
+group.add_argument('--patience-epochs', type=int, default=30, metavar='N',
                    help='patience epochs for Plateau LR scheduler (default: 10)')
 group.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
                    help='LR decay rate (default: 0.1)')
@@ -391,7 +555,22 @@ group.add_argument('--use-multi-epochs-loader', action='store_true', default=Fal
                    help='use the multi-epochs-loader to save time at the beginning of every epoch')
 group.add_argument('--log-wandb', action='store_true', default=False,
                    help='log training and validation metrics to wandb')
-
+# Thêm tham số cho Focal Loss và class weighting
+group.add_argument('--focal-loss', action='store_true', default=False,
+                   help='Use Focal Loss instead of Cross Entropy Loss')
+group.add_argument('--focal-gamma', type=float, default=2.0,
+                   help='Gamma parameter for Focal Loss (default: 2.0)')
+group.add_argument('--auto-weight', action='store_true', default=False,
+                   help='Automatically compute class weights based on class frequencies')
+group.add_argument('--auto-weight-method', type=str, default='inverse',
+                   choices=['inverse', 'effective', 'sqrt', 'log', 'smooth_power'],
+                   help='Method to compute class weights automatically')
+group.add_argument('--power', type=float, default=0.3,
+                   help='Power parameter for smooth_power weighting method')
+group.add_argument('--effective-beta', type=float, default=0.9999,
+                   help='Beta parameter for effective number weighting')
+group.add_argument('--class-weights', type=str, default=None, 
+                   help='Comma-separated list of class weights for imbalanced datasets')
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -757,9 +936,42 @@ def main():
             device=device,
             use_prefetcher=args.prefetcher,
         )
+    # Khởi tạo class weights nếu cần
+    class_weights = None
+    if hasattr(args, 'auto_weight') and args.auto_weight:
+        computed_weights, class_counts = compute_auto_weights(
+            dataset_train, 
+            args.num_classes, 
+            method=args.auto_weight_method,
+            beta=args.effective_beta,
+            power=args.power
+        )
+        
+        # Xem xét cả phân bố tập validation nếu được yêu cầu
+        class_weights = computed_weights.to(device)
+        
+        if utils.is_primary(args):
+            _logger.info(f"Class counts: {class_counts}")
+            _logger.info(f"Auto-computed weights using {args.auto_weight_method} method: {class_weights}")
 
+    elif hasattr(args, 'class_weights') and args.class_weights:
+        try:
+            weights = [float(w) for w in args.class_weights.split(',')]
+            class_weights = torch.FloatTensor(weights).to(device)
+            if utils.is_primary(args):
+                _logger.info(f"Using manual class weights: {weights}")
+        except:
+            if utils.is_primary(args):
+                _logger.warning("Failed to parse class weights, using uniform weights.")
     # setup loss function
-    if args.jsd_loss:
+    #da sua thanh focal loss
+    if hasattr(args, 'focal_loss') and args.focal_loss:
+        train_loss_fn = FocalLoss(alpha=class_weights, gamma=args.focal_gamma).to(device=device)
+        validate_loss_fn = FocalLoss(alpha=class_weights, gamma=args.focal_gamma).to(device=device)
+        if utils.is_primary(args):
+            _logger.info(f"Using Focal Loss with gamma={args.focal_gamma}" + 
+                        (f" and class weights" if class_weights is not None else ""))
+    elif args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
         train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing)
     elif mixup_active:
@@ -783,8 +995,13 @@ def main():
         else:
             train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
-        train_loss_fn = nn.CrossEntropyLoss()
+        if class_weights is not None:
+            train_loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+        else:
+            train_loss_fn = nn.CrossEntropyLoss()
+
     train_loss_fn = train_loss_fn.to(device=device)
+
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
 
     # setup checkpoint saver and eval metric tracking

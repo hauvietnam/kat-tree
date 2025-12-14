@@ -37,7 +37,10 @@ __all__ = ['KAT']  # model_registry will add each entrypoint fn to this
 _logger = logging.getLogger(__name__)
 
 import sys
-sys.path.insert(0, 'rational_kat_cu')
+rational_path = '/kaggle/working/rational_kat_cu'
+if rational_path not in sys.path:
+    sys.path.insert(0, rational_path)
+
 from kat_rational import KAT_Group
 
 
