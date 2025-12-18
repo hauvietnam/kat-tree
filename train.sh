@@ -6,7 +6,7 @@ CHECKPOINT_PATH=/kaggle/working/pretain.pth
 NUM_GPUS=2
 
 bash ./dist_train.sh $NUM_GPUS $DATA_PATH \
---model kat_small_patch16_224 \
+--model kat_base_patch16_224 \
 --resume $CHECKPOINT_PATH \
 -b 16 \
 --num-classes 250 \

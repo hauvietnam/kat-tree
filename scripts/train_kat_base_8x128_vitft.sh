@@ -1,5 +1,5 @@
 #!/bin/bash
-DATA_PATH=/mnt/disk2/home/vlir_hoang/Domain_Adaption/dataset
+DATA_PATH=/kaggle/working/dataset
 
 bash ./dist_train.sh 8 $DATA_PATH \
     --model kat_base_swish_patch16_224 \
