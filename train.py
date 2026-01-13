@@ -71,6 +71,139 @@ import katransformer
 #Add focal loss 
 import torch.nn.functional as F
 
+# ===================== ADVANCED LOSS FUNCTIONS =====================
+
+class LDAMLoss(nn.Module):
+    """
+    Label-Distribution-Aware Margin Loss
+    Paper: Learning Imbalanced Datasets with Label-Distribution-Aware Margin Loss (NeurIPS 2019)
+    """
+    def __init__(self, cls_num_list, max_m=0.5, weight=None, s=30):
+        super(LDAMLoss, self).__init__()
+        m_list = 1.0 / torch.sqrt(torch.sqrt(torch.FloatTensor(cls_num_list)))
+        m_list = m_list * (max_m / torch.max(m_list))
+        self.m_list = m_list
+        assert s > 0
+        self.s = s
+        self.weight = weight
+
+    def forward(self, x, target):
+        if self.m_list.device != x.device:
+            self.m_list = self.m_list.to(x.device)
+        
+        index = torch.zeros_like(x, dtype=torch.uint8)
+        index.scatter_(1, target.data.view(-1, 1), 1)
+        
+        index_float = index.type(torch.FloatTensor).to(x.device)
+        batch_m = torch.matmul(self.m_list[None, :], index_float.transpose(0, 1))
+        batch_m = batch_m.view((-1, 1))
+        
+        x_m = x - batch_m
+        output = torch.where(index, x_m, x)
+        
+        return F.cross_entropy(self.s * output, target, weight=self.weight)
+
+
+class AsymmetricLoss(nn.Module):
+    """
+    Asymmetric Loss for Multi-Label Classification (adapted for single-label)
+    Paper: Asymmetric Loss For Multi-Label Classification (ICCV 2021)
+    """
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8):
+        super(AsymmetricLoss, self).__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+
+    def forward(self, x, y):
+        # Convert single-label to multi-label format
+        if y.dim() == 1:
+            num_classes = x.shape[1]
+            y_one_hot = torch.zeros_like(x)
+            y_one_hot.scatter_(1, y.unsqueeze(1), 1)
+            y = y_one_hot
+
+        x_sigmoid = torch.sigmoid(x)
+        xs_pos = x_sigmoid
+        xs_neg = 1 - x_sigmoid
+
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1)
+
+        los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
+        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
+        loss = los_pos + los_neg
+
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            pt0 = xs_pos * y
+            pt1 = xs_neg * (1 - y)
+            pt = pt0 + pt1
+            one_sided_gamma = self.gamma_pos * y + self.gamma_neg * (1 - y)
+            one_sided_w = torch.pow(1 - pt, one_sided_gamma)
+            loss *= one_sided_w
+
+        return -loss.sum() / x.shape[0]
+
+
+class AsymmetricLossSingleLabel(nn.Module):
+    """
+    Asymmetric Loss optimized for single-label classification
+    """
+    def __init__(self, gamma_neg=4, gamma_pos=0, eps=1e-8, reduction='mean'):
+        super(AsymmetricLossSingleLabel, self).__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        num_classes = logits.shape[1]
+        probs = F.softmax(logits, dim=1)
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes).float()
+        
+        pos_probs = probs * targets_one_hot
+        neg_probs = probs * (1 - targets_one_hot)
+        
+        pos_weight = torch.pow(1 - pos_probs, self.gamma_pos)
+        neg_weight = torch.pow(neg_probs, self.gamma_neg)
+        
+        log_probs = F.log_softmax(logits, dim=1)
+        pos_loss = -targets_one_hot * log_probs * pos_weight
+        neg_loss = -(1 - targets_one_hot) * log_probs * neg_weight
+        
+        loss = pos_loss.sum(dim=1) + neg_loss.sum(dim=1)
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+class CombinedLoss(nn.Module):
+    """
+    Combined LDAM and Asymmetric Loss
+    """
+    def __init__(self, cls_num_list, max_m=0.5, s=30, 
+                 gamma_neg=4, gamma_pos=1, 
+                 lambda_ldam=0.5, lambda_asym=0.5):
+        super(CombinedLoss, self).__init__()
+        self.ldam_loss = LDAMLoss(cls_num_list, max_m=max_m, s=s)
+        self.asym_loss = AsymmetricLossSingleLabel(gamma_neg=gamma_neg, gamma_pos=gamma_pos)
+        self.lambda_ldam = lambda_ldam
+        self.lambda_asym = lambda_asym
+    
+    def forward(self, logits, targets):
+        loss_ldam = self.ldam_loss(logits, targets)
+        loss_asym = self.asym_loss(logits, targets)
+        loss = self.lambda_ldam * loss_ldam + self.lambda_asym * loss_asym
+        return loss
+
+
+# ===================== ORIGINAL FOCAL LOSS =====================
+
 class FocalLoss(nn.Module):
     """
     Focal Loss như được mô tả trong paper "Focal Loss for Dense Object Detection".
@@ -258,7 +391,7 @@ parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
 group.add_argument('--train-split', metavar='NAME', default='train',
                    help='dataset train split (default: train)')
-group.add_argument('--val-split', metavar='NAME', default='validation',
+group.add_argument('--val-split', metavar='NAME', default='val',
                    help='dataset validation split (default: validation)')
 parser.add_argument('--train-num-samples', default=None, type=int,
                     metavar='N', help='Manually specify num samples in train split, for IterableDatasets.')
@@ -562,7 +695,7 @@ group.add_argument('--focal-gamma', type=float, default=2.0,
                    help='Gamma parameter for Focal Loss (default: 2.0)')
 group.add_argument('--auto-weight', action='store_true', default=False,
                    help='Automatically compute class weights based on class frequencies')
-group.add_argument('--auto-weight-method', type=str, default='inverse',
+group.add_argument('--auto-weight-method', type=str, default='smooth_power',
                    choices=['inverse', 'effective', 'sqrt', 'log', 'smooth_power'],
                    help='Method to compute class weights automatically')
 group.add_argument('--power', type=float, default=0.3,
@@ -571,6 +704,33 @@ group.add_argument('--effective-beta', type=float, default=0.9999,
                    help='Beta parameter for effective number weighting')
 group.add_argument('--class-weights', type=str, default=None, 
                    help='Comma-separated list of class weights for imbalanced datasets')
+
+# ===================== ADVANCED LOSS PARAMETERS =====================
+group.add_argument('--ldam-loss', action='store_true', default=False,
+                   help='Use LDAM (Label-Distribution-Aware Margin) Loss')
+group.add_argument('--ldam-max-m', type=float, default=0.5,
+                   help='Maximum margin for LDAM loss (default: 0.5)')
+group.add_argument('--ldam-s', type=float, default=30.0,
+                   help='Scale parameter for LDAM loss (default: 30.0)')
+
+group.add_argument('--asymmetric-loss', action='store_true', default=False,
+                   help='Use Asymmetric Loss for imbalanced classification')
+group.add_argument('--asym-gamma-neg', type=float, default=4.0,
+                   help='Negative focusing parameter for asymmetric loss (default: 4.0)')
+group.add_argument('--asym-gamma-pos', type=float, default=1.0,
+                   help='Positive focusing parameter for asymmetric loss (default: 1.0)')
+group.add_argument('--asym-clip', type=float, default=0.05,
+                   help='Clipping parameter for asymmetric loss (default: 0.05)')
+group.add_argument('--asym-single-label', action='store_true', default=True,
+                   help='Use single-label optimized version of asymmetric loss')
+
+group.add_argument('--combined-loss', action='store_true', default=False,
+                   help='Use combined LDAM + Asymmetric Loss')
+group.add_argument('--lambda-ldam', type=float, default=0.5,
+                   help='Weight for LDAM loss in combined loss (default: 0.5)')
+group.add_argument('--lambda-asym', type=float, default=0.5,
+                   help='Weight for asymmetric loss in combined loss (default: 0.5)')
+
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -964,8 +1124,95 @@ def main():
             if utils.is_primary(args):
                 _logger.warning("Failed to parse class weights, using uniform weights.")
     # setup loss function
-    #da sua thanh focal loss
-    if hasattr(args, 'focal_loss') and args.focal_loss:
+    # ===================== ADVANCED LOSS SELECTION =====================
+    # Get class distribution for LDAM and Combined loss
+    cls_num_list = None
+    if hasattr(args, 'ldam_loss') and args.ldam_loss:
+        # Calculate class distribution from dataset
+        if hasattr(dataset_train, 'targets'):
+            targets = np.array(dataset_train.targets)
+        elif hasattr(dataset_train, 'samples'):
+            targets = np.array([s[1] for s in dataset_train.samples])
+        else:
+            # Fallback: count by iterating
+            _logger.info("Counting class distribution...")
+            targets = []
+            for i in range(min(len(dataset_train), 50000)):
+                _, target = dataset_train[i]
+                targets.append(target if isinstance(target, int) else target.item())
+            targets = np.array(targets)
+        
+        cls_num_list = [np.sum(targets == i) for i in range(args.num_classes)]
+        if utils.is_primary(args):
+            _logger.info(f"Class distribution: {cls_num_list}")
+    
+    # Select loss function based on args
+    if hasattr(args, 'ldam_loss') and args.ldam_loss:
+        # LDAM Loss
+        if cls_num_list is None:
+            raise ValueError("Class distribution not available for LDAM loss")
+        ldam_max_m = getattr(args, 'ldam_max_m', 0.5)
+        ldam_s = getattr(args, 'ldam_s', 30)
+        train_loss_fn = LDAMLoss(
+            cls_num_list=cls_num_list,
+            max_m=ldam_max_m,
+            weight=class_weights,
+            s=ldam_s
+        ).to(device=device)
+        validate_loss_fn = nn.CrossEntropyLoss()
+        if utils.is_primary(args):
+            _logger.info(f"Using LDAM Loss with max_m={ldam_max_m}, s={ldam_s}")
+    
+    elif hasattr(args, 'asymmetric_loss') and args.asymmetric_loss:
+        # Asymmetric Loss
+        asym_gamma_neg = getattr(args, 'asym_gamma_neg', 4)
+        asym_gamma_pos = getattr(args, 'asym_gamma_pos', 1)
+        asym_clip = getattr(args, 'asym_clip', 0.05)
+        
+        # Choose between multi-label and single-label version
+        if getattr(args, 'asym_single_label', True):
+            train_loss_fn = AsymmetricLossSingleLabel(
+                gamma_neg=asym_gamma_neg,
+                gamma_pos=asym_gamma_pos
+            ).to(device=device)
+        else:
+            train_loss_fn = AsymmetricLoss(
+                gamma_neg=asym_gamma_neg,
+                gamma_pos=asym_gamma_pos,
+                clip=asym_clip
+            ).to(device=device)
+        
+        validate_loss_fn = nn.CrossEntropyLoss()
+        if utils.is_primary(args):
+            _logger.info(f"Using Asymmetric Loss with gamma_neg={asym_gamma_neg}, gamma_pos={asym_gamma_pos}")
+    
+    elif hasattr(args, 'combined_loss') and args.combined_loss:
+        # Combined LDAM + Asymmetric Loss
+        if cls_num_list is None:
+            raise ValueError("Class distribution not available for Combined loss")
+        
+        ldam_max_m = getattr(args, 'ldam_max_m', 0.5)
+        ldam_s = getattr(args, 'ldam_s', 30)
+        asym_gamma_neg = getattr(args, 'asym_gamma_neg', 4)
+        asym_gamma_pos = getattr(args, 'asym_gamma_pos', 1)
+        lambda_ldam = getattr(args, 'lambda_ldam', 0.5)
+        lambda_asym = getattr(args, 'lambda_asym', 0.5)
+        
+        train_loss_fn = CombinedLoss(
+            cls_num_list=cls_num_list,
+            max_m=ldam_max_m,
+            s=ldam_s,
+            gamma_neg=asym_gamma_neg,
+            gamma_pos=asym_gamma_pos,
+            lambda_ldam=lambda_ldam,
+            lambda_asym=lambda_asym
+        ).to(device=device)
+        validate_loss_fn = nn.CrossEntropyLoss()
+        if utils.is_primary(args):
+            _logger.info(f"Using Combined Loss (LDAM + Asymmetric) with lambda_ldam={lambda_ldam}, lambda_asym={lambda_asym}")
+    
+    # ===================== ORIGINAL LOSS OPTIONS =====================
+    elif hasattr(args, 'focal_loss') and args.focal_loss:
         train_loss_fn = FocalLoss(alpha=class_weights, gamma=args.focal_gamma).to(device=device)
         validate_loss_fn = FocalLoss(alpha=class_weights, gamma=args.focal_gamma).to(device=device)
         if utils.is_primary(args):
@@ -1000,9 +1247,9 @@ def main():
         else:
             train_loss_fn = nn.CrossEntropyLoss()
 
-    train_loss_fn = train_loss_fn.to(device=device)
+    # train_loss_fn = train_loss_fn.to(device=device)
 
-    validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
+    # validate_loss_fn = validate_loss_fn().to(device=device)
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric if loader_eval is not None else 'loss'
@@ -1340,6 +1587,12 @@ def validate(
     top1_m = utils.AverageMeter()
     top5_m = utils.AverageMeter()
 
+    # --- [MOD START] Khởi tạo biến đếm cho từng Class ---
+    num_classes = args.num_classes
+    per_class_correct = torch.zeros(num_classes).to(device)
+    per_class_total = torch.zeros(num_classes).to(device)
+    # --- [MOD END] ---
+
     model.eval()
 
     end = time.time()
@@ -1365,7 +1618,25 @@ def validate(
                     target = target[0:target.size(0):reduce_factor]
 
                 loss = loss_fn(output, target)
+            
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+
+            # --- [MOD START] Tính toán độ chính xác từng lớp ---
+            # Lấy nhãn dự đoán (Top-1)
+            _, pred = output.max(1)
+            
+            # Tạo mask so sánh
+            correct_mask = (pred == target)
+            
+            # Cộng dồn số lượng mẫu của từng class (Total per class)
+            target_indices = target.view(-1)
+            per_class_total.scatter_add_(0, target_indices, torch.ones_like(target_indices, dtype=torch.float))
+            
+            # Cộng dồn số lượng đoán đúng của từng class (Correct per class)
+            correct_indices = target[correct_mask].view(-1)
+            if correct_indices.numel() > 0:
+                per_class_correct.scatter_add_(0, correct_indices, torch.ones_like(correct_indices, dtype=torch.float))
+            # --- [MOD END] ---
 
             if args.distributed:
                 reduced_loss = utils.reduce_tensor(loss.data, args.world_size)
@@ -1393,7 +1664,35 @@ def validate(
                     f'Acc@5: {top5_m.val:>7.3f} ({top5_m.avg:>7.3f})'
                 )
 
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
+    # --- [MOD START] Tổng hợp và tính Mean Class Accuracy ---
+    if args.distributed:
+        # Gom tổng từ tất cả GPU
+        import torch.distributed as dist
+        dist.all_reduce(per_class_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(per_class_total, op=dist.ReduceOp.SUM)
+    
+    # Tính accuracy cho từng class: correct / total
+    # Thêm 1e-8 để tránh chia cho 0 với các class không có trong tập val
+    class_acc = per_class_correct / (per_class_total + 1e-8)
+    
+    # Chỉ tính trung bình trên các class CÓ xuất hiện trong tập validation
+    # (Trường hợp tập validation quá nhỏ không bao phủ hết class)
+    valid_classes_mask = per_class_total > 0
+    if valid_classes_mask.sum() > 0:
+        mean_class_acc = class_acc[valid_classes_mask].mean().item() * 100.0
+    else:
+        mean_class_acc = 0.0
+
+    if utils.is_primary(args):
+        _logger.info(f' * Mean Class Accuracy: {mean_class_acc:.3f}%')
+    # --- [MOD END] ---
+
+    metrics = OrderedDict([
+        ('loss', losses_m.avg), 
+        ('top1', top1_m.avg), 
+        ('top5', top5_m.avg),
+        ('mean_class_acc', mean_class_acc) # Thêm key mới vào đây
+    ])
 
     return metrics
 
