@@ -75,33 +75,86 @@ import torch.nn.functional as F
 
 class LDAMLoss(nn.Module):
     """
-    Label-Distribution-Aware Margin Loss
+    Label-Distribution-Aware Margin Loss with Deferred Re-weighting (DRW)
     Paper: Learning Imbalanced Datasets with Label-Distribution-Aware Margin Loss (NeurIPS 2019)
     """
-    def __init__(self, cls_num_list, max_m=0.5, weight=None, s=30):
+    def __init__(self, cls_num_list, max_m=0.5, s=30, use_drw=False):
+        """
+        Args:
+            cls_num_list: list, number of samples per class
+            max_m: float, maximum margin (default: 0.5)
+            s: float, scale parameter (default: 30)
+            use_drw: bool, whether to use Deferred Re-weighting (default: False)
+        """
         super(LDAMLoss, self).__init__()
+        
+        # Calculate per-class margin based on frequency
         m_list = 1.0 / torch.sqrt(torch.sqrt(torch.FloatTensor(cls_num_list)))
         m_list = m_list * (max_m / torch.max(m_list))
         self.m_list = m_list
+        
         assert s > 0
         self.s = s
-        self.weight = weight
+        self.use_drw = use_drw
+        
+        # Calculate per-class weights for DRW
+        if use_drw:
+            import numpy as np
+            per_cls_weights = 1.0 / np.array(cls_num_list)
+            per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+            self.per_cls_weights = torch.FloatTensor(per_cls_weights)
+        else:
+            self.per_cls_weights = None
 
-    def forward(self, x, target):
+    def forward(self, x, target, epoch=None, total_epochs=None, drw_start_epoch=None):
+        """
+        Args:
+            x: torch.Tensor, logits with shape (batch_size, num_classes)
+            target: torch.Tensor, ground truth labels with shape (batch_size,)
+            epoch: int, current epoch (required if use_drw=True)
+            total_epochs: int, total training epochs (optional, for auto DRW start)
+            drw_start_epoch: int, epoch to start DRW (default: 0.8 * total_epochs)
+        Returns:
+            loss: torch.Tensor, scalar loss value
+        """
+        # Move margin to device
         if self.m_list.device != x.device:
             self.m_list = self.m_list.to(x.device)
         
+        # Create index mask for target classes
         index = torch.zeros_like(x, dtype=torch.uint8)
         index.scatter_(1, target.data.view(-1, 1), 1)
         
+        # Calculate per-sample margin based on class
         index_float = index.type(torch.FloatTensor).to(x.device)
         batch_m = torch.matmul(self.m_list[None, :], index_float.transpose(0, 1))
         batch_m = batch_m.view((-1, 1))
         
+        # Apply margin to target class logits
         x_m = x - batch_m
         output = torch.where(index, x_m, x)
         
-        return F.cross_entropy(self.s * output, target, weight=self.weight)
+        # ========== DEFERRED RE-WEIGHTING (DRW) ==========
+        weight = None
+        if self.use_drw and epoch is not None:
+            # Auto calculate DRW start epoch if not provided
+            if drw_start_epoch is None:
+                if total_epochs is not None:
+                    # Default: start DRW at 80% of training
+                    drw_start_epoch = int(0.8 * total_epochs)
+                else:
+                    # Fallback to paper default
+                    drw_start_epoch = 160
+            
+            # Enable re-weighting after drw_start_epoch
+            if epoch >= drw_start_epoch:
+                if self.per_cls_weights.device != x.device:
+                    self.per_cls_weights = self.per_cls_weights.to(x.device)
+                weight = self.per_cls_weights
+        # =================================================
+        
+        # Scale and compute cross entropy with optional re-weighting
+        return F.cross_entropy(self.s * output, target, weight=weight)
 
 
 class AsymmetricLoss(nn.Module):
@@ -391,7 +444,7 @@ parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
 group.add_argument('--train-split', metavar='NAME', default='train',
                    help='dataset train split (default: train)')
-group.add_argument('--val-split', metavar='NAME', default='val',
+group.add_argument('--val-split', metavar='NAME', default='validation',
                    help='dataset validation split (default: validation)')
 parser.add_argument('--train-num-samples', default=None, type=int,
                     metavar='N', help='Manually specify num samples in train split, for IterableDatasets.')
@@ -681,7 +734,7 @@ group.add_argument('--output', default='', type=str, metavar='PATH',
 group.add_argument('--experiment', default='', type=str, metavar='NAME',
                    help='name of train experiment, name of sub-folder for output')
 group.add_argument('--eval-metric', default='top1', type=str, metavar='EVAL_METRIC',
-                   help='Best metric (default: "top1"')
+                   help='Best metric (default: "top1"). Options: top1, top5, loss, mean_class_acc')
 group.add_argument('--tta', type=int, default=0, metavar='N',
                    help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
 group.add_argument('--use-multi-epochs-loader', action='store_true', default=False,
@@ -712,6 +765,12 @@ group.add_argument('--ldam-max-m', type=float, default=0.5,
                    help='Maximum margin for LDAM loss (default: 0.5)')
 group.add_argument('--ldam-s', type=float, default=30.0,
                    help='Scale parameter for LDAM loss (default: 30.0)')
+group.add_argument('--ldam-drw', action='store_true', default=False,
+                   help='Use Deferred Re-weighting (DRW) with LDAM loss')
+group.add_argument('--drw-start-epoch', type=int, default=None,
+                   help='Epoch to start DRW (default: 80%% of total epochs)')
+group.add_argument('--drw-start-ratio', type=float, default=0.8,
+                   help='Ratio of total epochs to start DRW (default: 0.8)')
 
 group.add_argument('--asymmetric-loss', action='store_true', default=False,
                    help='Use Asymmetric Loss for imbalanced classification')
@@ -1151,17 +1210,28 @@ def main():
         # LDAM Loss
         if cls_num_list is None:
             raise ValueError("Class distribution not available for LDAM loss")
+        
         ldam_max_m = getattr(args, 'ldam_max_m', 0.5)
         ldam_s = getattr(args, 'ldam_s', 30)
+        use_drw = getattr(args, 'ldam_drw', False)
+        
         train_loss_fn = LDAMLoss(
             cls_num_list=cls_num_list,
             max_m=ldam_max_m,
-            weight=class_weights,
-            s=ldam_s
+            s=ldam_s,
+            use_drw=use_drw
         ).to(device=device)
+        
         validate_loss_fn = nn.CrossEntropyLoss()
+        
         if utils.is_primary(args):
-            _logger.info(f"Using LDAM Loss with max_m={ldam_max_m}, s={ldam_s}")
+            drw_info = " with DRW" if use_drw else ""
+            if use_drw:
+                drw_start = getattr(args, 'drw_start_epoch', None)
+                if drw_start is None:
+                    drw_start = int(args.drw_start_ratio * args.epochs)
+                drw_info += f" (start epoch: {drw_start})"
+            _logger.info(f"Using LDAM Loss{drw_info} with max_m={ldam_max_m}, s={ldam_s}")
     
     elif hasattr(args, 'asymmetric_loss') and args.asymmetric_loss:
         # Asymmetric Loss
@@ -1246,6 +1316,15 @@ def main():
             train_loss_fn = nn.CrossEntropyLoss(weight=class_weights)
         else:
             train_loss_fn = nn.CrossEntropyLoss()
+    
+    # ===================== ENSURE VALIDATE LOSS IS ALWAYS DEFINED =====================
+    # If validate_loss_fn hasn't been set by any of the loss options above, set it to CrossEntropy
+    if 'validate_loss_fn' not in locals():
+        validate_loss_fn = nn.CrossEntropyLoss()
+    
+    # Move loss functions to device
+    train_loss_fn = train_loss_fn.to(device=device)
+    validate_loss_fn = validate_loss_fn.to(device=device)
 
     # train_loss_fn = train_loss_fn.to(device=device)
 
@@ -1253,7 +1332,9 @@ def main():
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric if loader_eval is not None else 'loss'
+    # Metrics that should be minimized (lower is better)
     decreasing_metric = eval_metric == 'loss'
+    # Note: top1, top5, mean_class_acc should be maximized (higher is better)
     best_metric = None
     best_epoch = None
     saver = None
@@ -1474,7 +1555,26 @@ def train_one_epoch(
         def _forward():
             with amp_autocast():
                 output = model(input)
-                loss = loss_fn(output, target)
+                
+                # Special handling for LDAM Loss with DRW
+                if isinstance(loss_fn, LDAMLoss) and loss_fn.use_drw:
+                    # Pass epoch info to enable DRW
+                    drw_start_epoch = getattr(args, 'drw_start_epoch', None)
+                    if drw_start_epoch is None:
+                        drw_start_ratio = getattr(args, 'drw_start_ratio', 0.8)
+                        drw_start_epoch = int(drw_start_ratio * args.epochs)
+                    
+                    loss = loss_fn(
+                        output, 
+                        target,
+                        epoch=epoch,
+                        total_epochs=args.epochs,
+                        drw_start_epoch=drw_start_epoch
+                    )
+                else:
+                    # Normal loss computation
+                    loss = loss_fn(output, target)
+            
             if accum_steps > 1:
                 loss /= accum_steps
             return loss
@@ -1538,6 +1638,19 @@ def train_one_epoch(
                 update_sample_count *= args.world_size
 
             if utils.is_primary(args):
+                # Check DRW status for logging
+                drw_status = ""
+                if isinstance(loss_fn, LDAMLoss) and loss_fn.use_drw:
+                    drw_start_epoch = getattr(args, 'drw_start_epoch', None)
+                    if drw_start_epoch is None:
+                        drw_start_ratio = getattr(args, 'drw_start_ratio', 0.8)
+                        drw_start_epoch = int(drw_start_ratio * args.epochs)
+                    
+                    if epoch >= drw_start_epoch:
+                        drw_status = " DRW:ON"
+                    else:
+                        drw_status = f" DRW:OFF(start@{drw_start_epoch})"
+                
                 _logger.info(
                     f'Train: {epoch} [{update_idx:>4d}/{updates_per_epoch} '
                     f'({100. * update_idx / (updates_per_epoch - 1):>3.0f}%)]  '
@@ -1545,7 +1658,7 @@ def train_one_epoch(
                     f'Time: {update_time_m.val:.3f}s, {update_sample_count / update_time_m.val:>7.2f}/s  '
                     f'({update_time_m.avg:.3f}s, {update_sample_count / update_time_m.avg:>7.2f}/s)  '
                     f'LR: {lr:.3e}  '
-                    f'Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})'
+                    f'Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f}){drw_status}'
                 )
 
                 if args.save_images and output_dir:
