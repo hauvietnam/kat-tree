@@ -1,14 +1,14 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # Import thêm cho padding
 from torch.utils.data import DataLoader
 import timm
 from timm.data import create_dataset, create_loader, resolve_data_config
-import katransformer  # Import để register KAT models
+import katransformer
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, f1_score
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
 from tqdm import tqdm
 import argparse
 import json
@@ -39,7 +39,7 @@ def create_test_loader(data_path, model, batch_size=64, num_workers=4):
     dataset = create_dataset(
         name='',
         root=data_path,
-        split='validation', 
+        split='validation',
         download=False,
         class_map=''
     )
@@ -53,91 +53,69 @@ def create_test_loader(data_path, model, batch_size=64, num_workers=4):
         mean=data_config['mean'],
         std=data_config['std'],
         num_workers=num_workers,
-        crop_pct=data_config['crop_pct'], # Có thể thử chỉnh lên 1.0 nếu muốn test không crop
+        crop_pct=1.0,
         pin_memory=True,
     )
     
     return loader, dataset
 
-def get_label_priors(data_loader, num_classes=25):
-    """
-    Tính tần suất xuất hiện của các class trong tập test hiện tại.
-    Dùng để cân bằng Logit Adjustment.
-    """
-    print("Computing class priors for Logit Adjustment...")
-    label_counts = {}
-    total_samples = 0
-    
-    # Duyệt nhanh để đếm (không forward model)
-    for _, targets in data_loader:
-        targets = targets.numpy()
-        for t in targets:
-            label_counts[t] = label_counts.get(t, 0) + 1
-            total_samples += 1
-            
-    priors = np.zeros(num_classes)
-    for cls, count in label_counts.items():
-        if cls < num_classes:
-            priors[cls] = count / total_samples
-            
-    # Tránh log(0) bằng cách gán giá trị rất nhỏ cho class không xuất hiện
-    priors = np.maximum(priors, 1e-6)
-    
-    return torch.from_numpy(priors).float()
-
-def evaluate_model(model, data_loader, device='cuda', use_tta=True, tau=1.0, num_classes=25):
+def evaluate_model(model, data_loader, device='cuda', use_tta=True):
 
     model.eval()
     model = model.to(device)
     
-    # 1. Chuẩn bị Priors cho Logit Adjustment
-    if tau > 0:
-        priors = get_label_priors(data_loader, num_classes).to(device)
-        log_priors = torch.log(priors)
-    
     all_preds = []
     all_targets = []
     
-    mode_msg = []
-    if use_tta: mode_msg.append("10-Crop TTA")
-    if tau > 0: mode_msg.append(f"Logit Adjustment (Tau={tau})")
-    print(f"\nEvaluating with: {' + '.join(mode_msg) if mode_msg else 'Standard Mode'}")
+    print(f"Evaluating model ...")
     
     with torch.no_grad():
         for images, targets in tqdm(data_loader, desc="Testing"):
             images = images.to(device)
             targets = targets.to(device)
             
-            # --- PHASE 1: PREDICTION (TTA or STANDARD) ---
             if use_tta:
-                # Kỹ thuật 10-Crop
+                # --- KỸ THUẬT 10-CROP TTA ---
+                # 1. Tạo 5 biến thể vị trí: Center, Top-Left, Top-Right, Bot-Left, Bot-Right
+                # Bằng cách pad ảnh lên rồi crop lại
                 b, c, h, w = images.shape
-                pad = 4 
+                pad = 4  # Dịch chuyển 4 pixel (phù hợp với ảnh 224)
                 padded = F.pad(images, (pad, pad, pad, pad), mode='reflect')
                 
-                crops = [images] # Center
+                crops = []
+
+                crops.append(images)
+                # 4 Góc
                 crops.append(padded[:, :, 0:h, 0:w])       # Top-Left
                 crops.append(padded[:, :, 0:h, -w:])       # Top-Right
                 crops.append(padded[:, :, -h:, 0:w])       # Bot-Left
                 crops.append(padded[:, :, -h:, -w:])       # Bot-Right
                 
+
                 crops_flipped = [torch.flip(c, [3]) for c in crops]
                 
-                # Stack thành batch lớn: (B*10, C, H, W)
-                inputs = torch.cat(crops + crops_flipped, dim=0)
+                # Tổng cộng 10 biến thể
+                all_variants = crops + crops_flipped
                 
+                # Stack lại thành batch lớn: (B*10, C, H, W)
+                # Lưu ý: Nếu batch size ban đầu quá lớn (ví dụ 64), 
+                # thì batch này sẽ thành 640 -> có thể OOM. 
+                # Code này an toàn vì default batch-size của bạn là 1.
+                inputs = torch.cat(all_variants, dim=0)
+                
+                # Forward pass
                 logits = model(inputs)
+                
+                # Reshape lại để tính trung bình: (10, B, Num_Classes)
                 logits = logits.view(10, b, -1)
-                outputs = logits.mean(dim=0) # Average Pooling
+                
+                # Lấy trung bình cộng các dự đoán (Ensemble logic)
+                outputs = logits.mean(dim=0)
             else:
+                # Đánh giá thường
                 outputs = model(images)
             
-            # --- PHASE 2: LOGIT ADJUSTMENT (Cân bằng Macro) ---
-            if tau > 0:
-                # Trừ đi bias của các class phổ biến
-                outputs = outputs - (tau * log_priors)
-
-            # Lấy kết quả cuối cùng
+            # Lấy predictions
             _, preds = torch.max(outputs, 1)
             
             all_preds.extend(preds.cpu().numpy())
@@ -146,19 +124,14 @@ def evaluate_model(model, data_loader, device='cuda', use_tta=True, tau=1.0, num
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
     
-    # Metrics
     accuracy = accuracy_score(all_targets, all_preds)
-    macro_f1 = f1_score(all_targets, all_preds, average='macro')
     
-    print(f"\n=== FINAL RESULTS ===")
-    print(f"Accuracy: {accuracy * 100:.4f}%")
-    print(f"Macro F1: {macro_f1:.4f}")
+    print(f"\nTest Accuracy: {accuracy * 100:.4f}%")
     
     results = {
         'accuracy': accuracy,
-        'macro_f1': macro_f1,
         'num_samples': len(all_targets),
-        'config': {'tta': use_tta, 'tau': tau}
+        'mode': 'tta_10_crop' if use_tta else 'standard'
     }
     
     return results, all_preds, all_targets
@@ -168,6 +141,7 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None,
                           figsize=(12, 10), 
                           normalize=False,
                           top_k_classes=None):
+    # (Giữ nguyên code cũ của hàm này)
     cm = confusion_matrix(y_true, y_pred)
     cm_raw = cm.copy()
     
@@ -198,11 +172,14 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None,
     
     sns.heatmap(cm_normalized if normalize else cm, 
                 annot=annotations if cm.shape[0] <= 30 else False,
-                fmt='', cmap='Blues',
+                fmt='',
+                cmap='Blues',
                 xticklabels=class_names if class_names else 'auto',
                 yticklabels=class_names if class_names else 'auto',
                 cbar_kws={'label': 'Proportion' if normalize else 'Count'},
-                square=True, linewidths=0.5, linecolor='gray')
+                square=True,
+                linewidths=0.5,
+                linecolor='gray')
     
     plt.title('Confusion Matrix' + (' (Normalized)' if normalize else ''), fontsize=14, fontweight='bold')
     plt.ylabel('True Label', fontsize=12)
@@ -217,22 +194,20 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None,
     plt.close()
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate KAT model with TTA and Logit Adjustment')
+    parser = argparse.ArgumentParser(description='Evaluate KAT model with TTA')
     parser.add_argument('--data_path', type=str, default='/mnt/disk2/home/vlir_hoang/Domain_Adaption/dataset')
     parser.add_argument('--model', type=str, default='kat_base_patch16_224')
     parser.add_argument('--checkpoint', type=str, default='/mnt/disk2/home/vlir_hoang/Domain_Adaption/kat/output/kat_focal_loss_weighted/20260108-231219-kat_base_patch16_224-224/model_best.pth.tar')
     
-    # Batch size nên giảm khi dùng TTA (vì 1 ảnh -> 10 ảnh)
-    parser.add_argument('--batch-size', type=int, default=16) 
+    # Để batch-size nhỏ khi dùng TTA để tránh tràn VRAM (vì mỗi ảnh sẽ nhân 10 lên)
+    parser.add_argument('--batch-size', type=int, default=16, help='Batch size should be smaller when using TTA') 
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--top-k-classes', type=int, default=25)
     parser.add_argument('--output-dir', type=str, default='./results')
     
-    # --- CÁC THAM SỐ QUAN TRỌNG ĐỂ CÂN BẰNG METRICS ---
-    parser.add_argument('--no-tta', action='store_true', help='Disable Test-Time Augmentation (10-Crop)')
-    parser.add_argument('--tau', type=float, default=0.8, 
-                        help='Logit Adjustment Factor. 0=Off, 1.0=Standard Balance. Increase to boost Macro, Decrease to save Accuracy.')
+    parser.add_argument('--aug-test', action='store_true', default=True, 
+                        help='')
 
     args = parser.parse_args()
     
@@ -245,22 +220,18 @@ def main():
     model = load_model(args.model, args.checkpoint)
     
     test_loader, test_dataset = create_test_loader(
-        args.data_path, model, 
-        batch_size=args.batch_size, 
+        args.data_path, 
+        model, 
+        batch_size=args.batch_size,
         num_workers=args.num_workers
     )
     
-    results, all_preds, all_targets = evaluate_model(
-        model, test_loader, device, 
-        use_tta=not args.no_tta,  
-        tau=args.tau
-    )
+
+    results, all_preds, all_targets = evaluate_model(model, test_loader, device, use_tta=args.aug_test)
     
-    # Lưu kết quả
     results_path = os.path.join(args.output_dir, 'results.json')
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=4)
-    print(f"Results saved to: {results_path}")
     
     class_names = [
         'Lim Xẹt', 'Lát Hoa', 'Lim Xanh', 'Thông Mã Vĩ', 'Keo Lá Tràm',
@@ -270,7 +241,6 @@ def main():
         'Mé Cò Ke', 'Bời Lời', 'Sồi Xanh', 'Nanh Chuột', 'Chẹo'
     ]
     
-    # Vẽ biểu đồ
     cm_path = os.path.join(args.output_dir, 'confusion_matrix.png')
     plot_confusion_matrix(all_targets, all_preds, class_names=class_names, save_path=cm_path, top_k_classes=args.top_k_classes)
     
