@@ -88,6 +88,7 @@ def create_test_loader(data_path, model, batch_size=64, num_workers=4):
         num_workers=num_workers,
         crop_pct=data_config['crop_pct'],
         pin_memory=True,
+        digits=6
     )
     
     return loader, dataset
