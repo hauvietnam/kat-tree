@@ -80,7 +80,7 @@ def create_test_loader(data_path, model, batch_size=64, num_workers=4):
         mean=data_config['mean'],
         std=data_config['std'],
         num_workers=num_workers,
-        crop_pct=data_config['crop_pct'],
+        crop_pct=1.0,
         pin_memory=True,
     )
     
