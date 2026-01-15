@@ -88,7 +88,6 @@ def create_test_loader(data_path, model, batch_size=64, num_workers=4):
         num_workers=num_workers,
         crop_pct=data_config['crop_pct'],
         pin_memory=True,
-        digits=6
     )
     
     return loader, dataset
@@ -137,7 +136,7 @@ def evaluate_model(model, data_loader, device='cuda'):
     # Tính toán metrics
     accuracy = accuracy_score(all_targets, all_preds)
     
-    print(f"\nTest Accuracy: {accuracy * 100:.2f}%")
+    print(f"\nTest Accuracy: {accuracy * 100:.4f}%")
     
     results = {
         'accuracy': accuracy,
@@ -324,7 +323,7 @@ def main():
         filtered_targets = all_targets[mask]
         filtered_preds = all_preds[mask]
         
-        print(classification_report(filtered_targets, filtered_preds))
+        print(classification_report(filtered_targets, filtered_preds, digits=4))
     
     print("\nEvaluation completed!")
 
