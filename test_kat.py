@@ -136,7 +136,7 @@ def evaluate_model(model, data_loader, device='cuda'):
     # Tính toán metrics
     accuracy = accuracy_score(all_targets, all_preds)
     
-    print(f"\nTest Accuracy: {accuracy * 100:.4f}%")
+    print(f"\nTest Accuracy: {accuracy * 100:.2f}%")
     
     results = {
         'accuracy': accuracy,
@@ -234,13 +234,13 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None,
 def main():
     parser = argparse.ArgumentParser(description='Evaluate KAT model and plot confusion matrix')
     parser.add_argument('--data_path', type=str, default='/mnt/disk2/home/vlir_hoang/Domain_Adaption/dataset', help='Path to ImageNet dataset')
-    parser.add_argument('--model', type=str, default='kat_base_patch16_224',
+    parser.add_argument('--model', type=str, default='kat_small_patch16_224',
                        help='Model name')
-    parser.add_argument('--checkpoint', type=str, default='/mnt/disk2/home/vlir_hoang/Domain_Adaption/kat/output/kat_focal_loss_weighted/20260108-231219-kat_base_patch16_224-224/model_best.pth.tar',
+    parser.add_argument('--checkpoint', type=str, default='/mnt/disk2/home/vlir_hoang/Domain_Adaption/kat/output/train/20251015-075735-kat_small_patch16_224-224/model_best.pth.tar',
                        help='Path to checkpoint file')
     parser.add_argument('--batch-size', type=int, default=1,
                        help='Batch size for evaluation')
-    parser.add_argument('--num-workers', type=int, default=1,
+    parser.add_argument('--num-workers', type=int, default=4,
                        help='Number of data loading workers')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use (cuda or cpu)')
@@ -323,7 +323,7 @@ def main():
         filtered_targets = all_targets[mask]
         filtered_preds = all_preds[mask]
         
-        print(classification_report(filtered_targets, filtered_preds, digits=4))
+        print(classification_report(filtered_targets, filtered_preds))
     
     print("\nEvaluation completed!")
 
